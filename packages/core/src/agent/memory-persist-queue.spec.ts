@@ -217,6 +217,40 @@ describe("MemoryPersistQueue", () => {
     expect(buffers.every((buffer) => buffer.getPendingMessages().length === 0)).toBe(true);
   });
 
+  it("uses the flushing operation's trace when it cancels another queue's debounce", async () => {
+    const oldMessage = createMessage("scheduled turn");
+    const newMessage = createMessage("flushing turn");
+    const memoryManager = { saveMessage: vi.fn().mockResolvedValue(undefined) } as any;
+    const oldBuffer = new ConversationBuffer();
+    oldBuffer.ingestUIMessages([oldMessage], false);
+    const newBuffer = new ConversationBuffer();
+    newBuffer.ingestUIMessages([newMessage], false);
+    const oldContext = {
+      ...createOperationContext(),
+      operationId: "scheduled-operation",
+      traceContext: { id: "old-trace" },
+    };
+    const newContext = {
+      ...createOperationContext(),
+      operationId: "flushing-operation",
+      traceContext: { id: "new-trace" },
+    };
+
+    new MemoryPersistQueue(memoryManager, { debounceMs: 100 }).scheduleSave(
+      oldBuffer,
+      oldContext as any,
+    );
+    await new MemoryPersistQueue(memoryManager).flush(newBuffer, newContext as any);
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(memoryManager.saveMessage).toHaveBeenCalledTimes(2);
+    expect(memoryManager.saveMessage.mock.calls[0][0]).toMatchObject({
+      operationId: oldContext.operationId,
+      traceContext: newContext.traceContext,
+    });
+    expect(memoryManager.saveMessage.mock.calls[1][0]).toBe(newContext);
+  });
+
   it("attempts every retained buffer before rethrowing the first failure", async () => {
     const firstMessage = createMessage("previous turn");
     const secondMessage = createMessage("next turn");
@@ -263,8 +297,8 @@ describe("MemoryPersistQueue", () => {
     oldBuffer.ingestUIMessages([oldMessage], false);
     const newBuffer = new ConversationBuffer();
     newBuffer.ingestUIMessages([newMessage], false);
-    const oldContext = { ...createOperationContext(), isActive: false };
-    const newContext = { ...createOperationContext(), isActive: false };
+    const oldContext = { ...createOperationContext(), isActive: true };
+    const newContext = { ...createOperationContext(), isActive: true };
     const queue = new MemoryPersistQueue(memoryManager, {
       maxRetryBuffers: 1,
       retryRetentionMs: 60_000,
@@ -288,7 +322,7 @@ describe("MemoryPersistQueue", () => {
     expect(newBuffer.getPendingMessages()).toHaveLength(0);
   });
 
-  it("drops an inactive failed buffer after its retry retention window", async () => {
+  it("drops a failed buffer after its retry retention window while its context stays active", async () => {
     const message = createMessage("expired turn");
     const memoryManager = {
       saveMessage: vi
@@ -298,7 +332,7 @@ describe("MemoryPersistQueue", () => {
     } as any;
     const buffer = new ConversationBuffer();
     buffer.ingestUIMessages([message], false);
-    const context = { ...createOperationContext(), isActive: false };
+    const context = { ...createOperationContext(), isActive: true };
     const queue = new MemoryPersistQueue(memoryManager, {
       retryRetentionMs: 1_000,
     });
@@ -310,9 +344,33 @@ describe("MemoryPersistQueue", () => {
     expect(buffer.getPendingMessages()).toHaveLength(1);
     const entriesByManager = (MemoryPersistQueue as any).entriesByManager as WeakMap<
       object,
-      Map<string, unknown>
+      { entries: Map<string, unknown> }
     >;
-    expect(entriesByManager.get(memoryManager)?.size ?? 0).toBe(0);
+    expect(entriesByManager.get(memoryManager)?.entries.size ?? 0).toBe(0);
+  });
+
+  it("uses one cleanup timer for failed buffers shared by queue instances", async () => {
+    const memoryManager = {
+      saveMessage: vi.fn().mockRejectedValue(new Error("storage down")),
+    } as any;
+    const firstBuffer = new ConversationBuffer();
+    firstBuffer.ingestUIMessages([createMessage("first")], false);
+    const secondBuffer = new ConversationBuffer();
+    secondBuffer.ingestUIMessages([createMessage("second")], false);
+    const options = { retryRetentionMs: 1_000 };
+    const firstContext = { ...createOperationContext(), conversationId: "first", isActive: true };
+    const secondContext = { ...createOperationContext(), conversationId: "second", isActive: true };
+
+    await expect(
+      new MemoryPersistQueue(memoryManager, options).flush(firstBuffer, firstContext as any),
+    ).rejects.toThrow("storage down");
+    await expect(
+      new MemoryPersistQueue(memoryManager, options).flush(secondBuffer, secondContext as any),
+    ).rejects.toThrow("storage down");
+
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("keeps retries separate for user and conversation IDs containing colons", async () => {

@@ -8,7 +8,14 @@ import type { OperationContext } from "./types";
 interface QueueEntry {
   timer?: NodeJS.Timeout;
   pendingPromise: Promise<void>;
+  pendingTasks: number;
   buffers: Map<ConversationBuffer, QueueBuffer>;
+}
+
+interface QueueState {
+  entries: Map<string, QueueEntry>;
+  retentionCleanupTimer?: NodeJS.Timeout;
+  retentionCleanupAt?: number;
 }
 
 interface QueueBuffer {
@@ -41,14 +48,14 @@ export interface AgentMetadataContextValue {
 export class MemoryPersistQueue {
   private static readonly entriesByManager = new WeakMap<
     MemoryPersistQueueMemoryManager,
-    Map<string, QueueEntry>
+    QueueState
   >();
   private readonly debounceMs: number;
   private readonly logger?: Logger;
   private readonly maxRetryBuffers: number;
   private readonly retryRetentionMs: number;
+  private readonly state: QueueState;
   private readonly entries: Map<string, QueueEntry>;
-  private retentionCleanupTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly memoryManager: MemoryPersistQueueMemoryManager,
@@ -58,12 +65,13 @@ export class MemoryPersistQueue {
     this.logger = options.logger;
     this.maxRetryBuffers = Math.max(0, options.maxRetryBuffers ?? 32);
     this.retryRetentionMs = Math.max(0, options.retryRetentionMs ?? 5 * 60_000);
-    let entries = MemoryPersistQueue.entriesByManager.get(memoryManager);
-    if (!entries) {
-      entries = new Map();
-      MemoryPersistQueue.entriesByManager.set(memoryManager, entries);
+    let state = MemoryPersistQueue.entriesByManager.get(memoryManager);
+    if (!state) {
+      state = { entries: new Map() };
+      MemoryPersistQueue.entriesByManager.set(memoryManager, state);
     }
-    this.entries = entries;
+    this.state = state;
+    this.entries = state.entries;
   }
 
   scheduleSave(buffer: ConversationBuffer, oc: OperationContext): void {
@@ -87,7 +95,7 @@ export class MemoryPersistQueue {
 
     entry.timer = setTimeout(() => {
       entry.timer = undefined;
-      void this.enqueuePersist(key, () => this.persistAll(key)).catch(() => {});
+      void this.enqueuePersist(key, () => this.persistAll(key, oc)).catch(() => {});
     }, this.debounceMs);
 
     const logPayload = {
@@ -121,10 +129,10 @@ export class MemoryPersistQueue {
     };
     this.logger?.debug?.("Flushing conversation persistence queue", flushPayload);
 
-    await this.enqueuePersist(key, () => this.persistAll(key));
+    await this.enqueuePersist(key, () => this.persistAll(key, oc));
   }
 
-  private async persistAll(key: string): Promise<void> {
+  private async persistAll(key: string, triggerContext: OperationContext): Promise<void> {
     const entry = this.entries.get(key);
     if (!entry) return;
 
@@ -134,7 +142,7 @@ export class MemoryPersistQueue {
 
     for (const [buffer, queued] of [...entry.buffers]) {
       try {
-        await this.persist(buffer, queued.context);
+        await this.persist(buffer, queued.context, triggerContext);
         if (buffer.getPendingMessages().length === 0) {
           entry.buffers.delete(buffer);
         }
@@ -152,7 +160,11 @@ export class MemoryPersistQueue {
     if (hasError) throw firstError;
   }
 
-  private async persist(buffer: ConversationBuffer, oc: OperationContext): Promise<void> {
+  private async persist(
+    buffer: ConversationBuffer,
+    oc: OperationContext,
+    triggerContext: OperationContext,
+  ): Promise<void> {
     if (!oc.userId || !oc.conversationId) {
       return;
     }
@@ -189,8 +201,13 @@ export class MemoryPersistQueue {
           defaultMetadata: shouldApplySubAgentMetadata ? agentMetadata : undefined,
           toolCallMetadata,
         });
+        // Keep the message's original operation metadata while tracing the actual write attempt.
+        const writeContext =
+          oc === triggerContext || !triggerContext.traceContext
+            ? oc
+            : { ...oc, logger: triggerContext.logger, traceContext: triggerContext.traceContext };
         await this.memoryManager.saveMessage(
-          oc,
+          writeContext,
           messageWithMetadata,
           oc.userId,
           oc.conversationId,
@@ -212,6 +229,7 @@ export class MemoryPersistQueue {
 
   private enqueuePersist(key: string, task: () => Promise<void>): Promise<void> {
     const entry = this.getOrCreateEntry(key);
+    entry.pendingTasks++;
 
     entry.pendingPromise = entry.pendingPromise
       .catch(() => {})
@@ -223,8 +241,14 @@ export class MemoryPersistQueue {
         throw error;
       })
       .finally(() => {
+        entry.pendingTasks--;
         const current = this.entries.get(key);
-        if (current === entry && !current.timer && current.buffers.size === 0) {
+        if (
+          current === entry &&
+          !current.timer &&
+          current.buffers.size === 0 &&
+          current.pendingTasks === 0
+        ) {
           this.entries.delete(key);
         }
       });
@@ -235,7 +259,7 @@ export class MemoryPersistQueue {
   private getOrCreateEntry(key: string): QueueEntry {
     let entry = this.entries.get(key);
     if (!entry) {
-      entry = { pendingPromise: Promise.resolve(), buffers: new Map() };
+      entry = { pendingPromise: Promise.resolve(), pendingTasks: 0, buffers: new Map() };
       this.entries.set(key, entry);
     }
     return entry;
@@ -253,17 +277,18 @@ export class MemoryPersistQueue {
       for (const [buffer, queued] of entry.buffers) {
         if (queued.retainedAt === undefined) continue;
 
-        if (!queued.context.isActive && now - queued.retainedAt >= this.retryRetentionMs) {
+        if (now - queued.retainedAt >= this.retryRetentionMs) {
           entry.buffers.delete(buffer);
           this.logger?.warn?.("Dropping expired conversation persistence retry", {
+            conversationId: queued.context.conversationId,
+            userId: queued.context.userId,
+            pendingMessageCount: buffer.getPendingMessages().length,
             retainedForMs: now - queued.retainedAt,
           });
           continue;
         }
 
-        if (!queued.context.isActive) {
-          retained.push({ buffer, entry, retainedAt: queued.retainedAt });
-        }
+        retained.push({ buffer, entry, retainedAt: queued.retainedAt });
       }
     }
 
@@ -275,43 +300,63 @@ export class MemoryPersistQueue {
       if (queued?.retainedAt !== oldest.retainedAt) continue;
       oldest.entry.buffers.delete(oldest.buffer);
       this.logger?.warn?.("Dropping conversation persistence retry limit exceeded", {
+        conversationId: queued.context.conversationId,
+        userId: queued.context.userId,
+        pendingMessageCount: oldest.buffer.getPendingMessages().length,
         maxRetryBuffers: this.maxRetryBuffers,
       });
     }
 
     for (const [key, entry] of this.entries) {
-      if (!entry.timer && entry.buffers.size === 0) {
+      if (!entry.timer && entry.buffers.size === 0 && entry.pendingTasks === 0) {
         this.entries.delete(key);
       }
     }
   }
 
   private scheduleRetentionCleanup(): void {
-    if (!this.hasRetainedBuffers()) {
-      if (this.retentionCleanupTimer) {
-        clearTimeout(this.retentionCleanupTimer);
-        this.retentionCleanupTimer = undefined;
+    const nextExpiry = this.getNextRetentionExpiry();
+    if (nextExpiry === undefined) {
+      if (this.state.retentionCleanupTimer) {
+        clearTimeout(this.state.retentionCleanupTimer);
+        this.state.retentionCleanupTimer = undefined;
+        this.state.retentionCleanupAt = undefined;
       }
       return;
     }
-    if (this.retentionCleanupTimer) return;
+    if (
+      this.state.retentionCleanupTimer &&
+      this.state.retentionCleanupAt !== undefined &&
+      this.state.retentionCleanupAt <= nextExpiry
+    ) {
+      return;
+    }
+    if (this.state.retentionCleanupTimer) clearTimeout(this.state.retentionCleanupTimer);
 
-    const delay = Math.max(1, this.retryRetentionMs);
-    this.retentionCleanupTimer = setTimeout(() => {
-      this.retentionCleanupTimer = undefined;
-      this.pruneRetainedBuffers();
-      this.scheduleRetentionCleanup();
-    }, delay);
-    this.retentionCleanupTimer.unref?.();
+    this.state.retentionCleanupAt = nextExpiry;
+    this.state.retentionCleanupTimer = setTimeout(
+      () => {
+        this.state.retentionCleanupTimer = undefined;
+        this.state.retentionCleanupAt = undefined;
+        this.pruneRetainedBuffers();
+        this.scheduleRetentionCleanup();
+      },
+      Math.max(1, nextExpiry - Date.now()),
+    );
+    this.state.retentionCleanupTimer.unref?.();
   }
 
-  private hasRetainedBuffers(): boolean {
+  private getNextRetentionExpiry(): number | undefined {
+    let nextExpiry: number | undefined;
     for (const entry of this.entries.values()) {
       for (const queued of entry.buffers.values()) {
-        if (queued.retainedAt !== undefined) return true;
+        if (queued.retainedAt !== undefined) {
+          const expiry = queued.retainedAt + this.retryRetentionMs;
+          nextExpiry = nextExpiry === undefined ? expiry : Math.min(nextExpiry, expiry);
+        }
       }
     }
-    return false;
+    return nextExpiry;
   }
 
   private getKey(oc: OperationContext): string {
