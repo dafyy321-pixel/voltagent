@@ -325,6 +325,7 @@ describe.sequential("create-voltagent-app CLI option matrix", () => {
         const readme = await fsExtra.readFile(path.join(projectDir, "README.md"), "utf8");
         expect(readme).toContain("so no Dockerfile was generated");
         expect(readme).not.toContain("docker build -t");
+        expect(readme).not.toContain("├── Dockerfile");
         expect(warningSpy).toHaveBeenCalledWith(
           expect.stringContaining("This project will be created without a Dockerfile"),
         );

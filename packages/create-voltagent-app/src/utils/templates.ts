@@ -75,10 +75,12 @@ export const getBaseTemplates = (): TemplateFile[] => {
           .replace(/{{apiKeyUrl}}/g, config.apiKeyUrl || "");
 
         if (!supportsDockerfile(options.packageManager, options.packageManagerVersion)) {
-          return result.replace(
-            /## 🐳 Docker Deployment[\s\S]*?(?=## 🛠️ Development)/,
-            `## 🐳 Docker Deployment\n\nThis project uses Yarn ${options.packageManagerVersion}. The starter Dockerfile supports Yarn Classic (1.x) only, so no Dockerfile was generated. Add a Dockerfile that supports your Yarn version and configuration before building an image.\n\n`,
-          );
+          return result
+            .replace(/^├── Dockerfile.*\r?\n/m, "")
+            .replace(
+              /## 🐳 Docker Deployment[\s\S]*?(?=## 🛠️ Development)/,
+              `## 🐳 Docker Deployment\n\nThis project uses Yarn ${options.packageManagerVersion}. The starter Dockerfile supports Yarn Classic (1.x) only, so no Dockerfile was generated. Add a Dockerfile that supports your Yarn version and configuration before building an image.\n\n`,
+            );
         }
         return result;
       },
