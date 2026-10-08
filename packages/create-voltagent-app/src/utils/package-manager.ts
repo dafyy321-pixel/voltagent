@@ -65,3 +65,6 @@ export const getPackageManagerVersion = (packageManager: PackageManager): string
   }
   return version;
 };
+
+export const supportsDockerfile = (packageManager: PackageManager, version: string): boolean =>
+  packageManager !== "yarn" || version.startsWith("1.");

@@ -17,6 +17,7 @@ import {
 import { showSuccessMessage } from "./utils/animation";
 import { createBaseDependencyInstaller } from "./utils/dependency-installer";
 import { promptForApiKey } from "./utils/env-manager";
+import logger from "./utils/logger";
 import {
   getDefaultPackageManager,
   getInstalledPackageManagers,
@@ -51,6 +52,8 @@ vi.mock("./utils/package-manager", () => ({
   getDefaultPackageManager: vi.fn(),
   getInstalledPackageManagers: vi.fn(),
   getPackageManagerVersion: vi.fn(),
+  supportsDockerfile: (packageManager: PackageManager, version: string) =>
+    packageManager !== "yarn" || version.startsWith("1."),
 }));
 
 vi.mock("./utils/env-manager", () => ({
@@ -68,6 +71,7 @@ type Scenario = {
   aiProvider: AIProvider;
   ide: NonNullable<ProjectOptions["ide"]>;
   apiKey?: string;
+  packageManagerVersion?: string;
 };
 
 const scenarios: Scenario[] = [
@@ -92,6 +96,14 @@ const scenarios: Scenario[] = [
     packageManager: "yarn",
     aiProvider: "google",
     ide: "windsurf",
+  },
+  {
+    name: "google-hono-yarn-modern-none",
+    server: "hono",
+    packageManager: "yarn",
+    packageManagerVersion: "4.9.0",
+    aiProvider: "google",
+    ide: "none",
   },
   {
     name: "groq-elysia-npm-vscode",
@@ -254,6 +266,12 @@ describe.sequential("create-voltagent-app CLI option matrix", () => {
     const ideCoverage = new Set<NonNullable<ProjectOptions["ide"]>>();
 
     for (const scenario of scenarios) {
+      vi.mocked(getPackageManagerVersion).mockImplementation(
+        (packageManager) =>
+          scenario.packageManagerVersion ??
+          { npm: "10.9.3", yarn: "1.22.22", pnpm: "8.10.5", bun: "1.4.0" }[packageManager],
+      );
+      const warningSpy = vi.spyOn(logger, "warning");
       const projectName = `app-${scenario.name}`;
       process.argv = [originalArgv[0] ?? "node", "create-voltagent-app", projectName];
 
@@ -301,6 +319,18 @@ describe.sequential("create-voltagent-app CLI option matrix", () => {
       expect(indexContent).toContain(`from "${SERVER_CONFIG[scenario.server].package}"`);
       expect(indexContent).toContain(`server: ${SERVER_CONFIG[scenario.server].factory}()`);
       expect(indexContent).toContain(`model: "${AI_PROVIDER_CONFIG[scenario.aiProvider].model}"`);
+
+      if (scenario.packageManagerVersion === "4.9.0") {
+        expect(fs.existsSync(path.join(projectDir, "Dockerfile"))).toBe(false);
+        const readme = await fsExtra.readFile(path.join(projectDir, "README.md"), "utf8");
+        expect(readme).toContain("so no Dockerfile was generated");
+        expect(readme).not.toContain("docker build -t");
+        expect(warningSpy).toHaveBeenCalledWith(
+          expect.stringContaining("This project will be created without a Dockerfile"),
+        );
+        warningSpy.mockRestore();
+        continue;
+      }
 
       const dockerfile = await fsExtra.readFile(path.join(projectDir, "Dockerfile"), "utf8");
       const lockfileCopies = dockerfile
@@ -357,6 +387,7 @@ describe.sequential("create-voltagent-app CLI option matrix", () => {
         ).toHaveLength(2);
       }
       expect(dockerfile).not.toContain("{{");
+      warningSpy.mockRestore();
 
       const envContent = await fsExtra.readFile(path.join(projectDir, ".env"), "utf8");
       if (scenario.aiProvider === "ollama") {

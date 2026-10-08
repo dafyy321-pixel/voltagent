@@ -5,6 +5,7 @@ import {
   SERVER_CONFIG,
   type TemplateFile,
 } from "../types";
+import { supportsDockerfile } from "./package-manager";
 
 // Resolve templates for both source execution (src/) and built execution (dist/).
 const resolveTemplatesDir = () => {
@@ -60,7 +61,7 @@ export const getBaseTemplates = (): TemplateFile[] => {
         envConfig +=
           "\n\n# VoltOps Platform (Optional)\n# Get your keys at https://console.voltagent.dev/tracing-setup\n# VOLTAGENT_PUBLIC_KEY=your-public-key\n# VOLTAGENT_SECRET_KEY=your-secret-key";
 
-        return content
+        const result = content
           .replace(/{{projectName}}/g, options.projectName)
           .replace(/{{aiProviderName}}/g, config.name)
           .replace(/{{modelName}}/g, config.modelName)
@@ -72,6 +73,14 @@ export const getBaseTemplates = (): TemplateFile[] => {
           .replace(/{{packageManagerCommand}}/g, pm.command)
           .replace(/{{envConfig}}/g, envConfig)
           .replace(/{{apiKeyUrl}}/g, config.apiKeyUrl || "");
+
+        if (!supportsDockerfile(options.packageManager, options.packageManagerVersion)) {
+          return result.replace(
+            /## 🐳 Docker Deployment[\s\S]*?(?=## 🛠️ Development)/,
+            `## 🐳 Docker Deployment\n\nThis project uses Yarn ${options.packageManagerVersion}. The starter Dockerfile supports Yarn Classic (1.x) only, so no Dockerfile was generated. Add a Dockerfile that supports your Yarn version and configuration before building an image.\n\n`,
+          );
+        }
+        return result;
       },
     },
     {
@@ -135,7 +144,7 @@ export const getBaseTemplates = (): TemplateFile[] => {
       sourcePath: path.join(TEMPLATES_DIR, "base/Dockerfile.template"),
       targetPath: "Dockerfile",
       transform: (content: string, options: ProjectOptions) => {
-        if (options.packageManager === "yarn" && !options.packageManagerVersion.startsWith("1.")) {
+        if (!supportsDockerfile(options.packageManager, options.packageManagerVersion)) {
           throw new Error("Docker generation currently supports Yarn Classic (1.x) only.");
         }
         const packageManagers = {

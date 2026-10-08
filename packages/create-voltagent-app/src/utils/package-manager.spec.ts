@@ -1,6 +1,10 @@
 import { execSync } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { getInstalledPackageManagers, getPackageManagerVersion } from "./package-manager";
+import {
+  getInstalledPackageManagers,
+  getPackageManagerVersion,
+  supportsDockerfile,
+} from "./package-manager";
 
 vi.mock("node:child_process", () => ({ execSync: vi.fn() }));
 
@@ -21,6 +25,8 @@ describe("package manager detection", () => {
       String(command).endsWith("yarn --version") ? "4.9.0\n" : "",
     );
     expect(getInstalledPackageManagers()).toContain("yarn");
+    expect(supportsDockerfile("yarn", "4.9.0")).toBe(false);
+    expect(supportsDockerfile("yarn", "1.22.22")).toBe(true);
   });
 
   it("accepts prerelease manager versions for Docker pinning", () => {

@@ -28,6 +28,7 @@ import {
   getDefaultPackageManager,
   getInstalledPackageManagers,
   getPackageManagerVersion,
+  supportsDockerfile,
 } from "./utils/package-manager";
 
 export const runCLI = async (): Promise<void> => {
@@ -133,6 +134,11 @@ export const runCLI = async (): Promise<void> => {
 
       try {
         const packageManagerVersion = getPackageManagerVersion(packageManager);
+        if (!supportsDockerfile(packageManager, packageManagerVersion)) {
+          logger.warning(
+            `Yarn ${packageManagerVersion} is supported for project creation, but the starter Dockerfile supports Yarn Classic (1.x) only. This project will be created without a Dockerfile.`,
+          );
+        }
 
         // Start installing base dependencies immediately
         const baseDependencyInstaller = await createBaseDependencyInstaller(
